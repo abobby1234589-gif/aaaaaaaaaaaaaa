@@ -1,0 +1,375 @@
+--!nocheck
+--[[
+    Backseat Rally - Auto Farm v10
+    Pauses at start, auto-starts, drives until MinTime-3s per map, teleports, auto-retries
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+
+local LP = Players.LocalPlayer
+local CarFolder = LP.PlayerScripts.Client.Init.Car
+
+local CarController = require(CarFolder.CarController)
+local CarInput = require(CarFolder.CarInput)
+local AutoDrive = require(CarFolder.AutoDrive)
+local Cars = require(ReplicatedStorage.Balancing.Core.Cars)
+local DataController = require(LP.PlayerScripts.Client.Init.Data.DataController)
+
+local StageAction = ReplicatedStorage.Shared.RBXUtil.Net:WaitForChild("RE/StageAction")
+
+local STAGES = { "PineForest", "AlpinePass", "CoastalCliffs", "RiverbendCanyon", "SakuraPass" }
+local STAGE_MIN_TIME = {
+    PineForest = 45,
+    AlpinePass = 53,
+    CoastalCliffs = 71,
+    RiverbendCanyon = 91,
+    SakuraPass = 46,
+}
+
+local TP_BUFFER = 3
+
+local S = {
+    running        = false,
+    unloaded       = false,
+    mode           = "Blatant TP",
+    stage          = "PineForest",
+    autoRestart    = true,
+    showMarker     = true,
+    autoEnterCar   = true,
+    phase          = "idle",
+    runningSince   = 0,
+    lastStartAt    = 0,
+    lastGoAt       = 0,
+    runs           = 0,
+    runTimes       = {},
+    originalRead   = nil,
+    originalMaxSpd = nil,
+    marker         = nil,
+    statusLabel    = nil,
+    gaugeLabel     = nil,
+    keybindConn    = nil,
+    tpTriggered    = false,
+    startedThisRun = false,
+    toggleKey      = Enum.KeyCode.LeftControl,
+}
+
+local function getLocalData()
+    local ok, data = pcall(DataController.GetLocalData, DataController)
+    return ok and data or nil
+end
+local function getProgress()
+    local d = getLocalData()
+    return d and d.Data and d.Data.Progress or nil
+end
+local function getLevel() local p = getProgress() return p and p.Level or 0 end
+local function getXP() local p = getProgress() return p and p.XP or 0 end
+local function getTotalXP() local p = getProgress() return p and p.TotalXP or 0 end
+local function getCredits() local p = getProgress() return p and p.Credits or 0 end
+local function getXPMax() return math.floor(200 + getLevel() * 42.5) end
+local function getFinishes()
+    local d = getLocalData()
+    return d and d.Data and d.Data.Leaderstats and d.Data.Leaderstats.Finishes or 0
+end
+local function getBestTime(stage)
+    local d = getLocalData()
+    return d and d.Data and d.Data.Stats and d.Data.Stats.BestTimes and d.Data.Stats.BestTimes[stage] or nil
+end
+local function getMasteryXP(carId)
+    local d = getLocalData()
+    return d and d.Data and d.Data.Mastery and d.Data.Mastery[carId] and d.Data.Mastery[carId].XP or 0
+end
+local function fmtTime(s)
+    if not s or s < 0 then return "--:--" end
+    return string.format("%d:%05.2f", math.floor(s / 60), s % 60)
+end
+
+local function getCar()
+    if S.unloaded then return nil end
+    local c = CarController.LocalCar
+    return (c and c.Parent) and c or nil
+end
+local function getChassis(car)
+    local ok, ch = pcall(CarController.GetChassis, car)
+    return ok and ch or nil
+end
+local function setDesc(label, text)
+    if label and not S.unloaded then pcall(function() label:SetDesc(text) end) end
+end
+local function setStatus(text)
+    S.phase = text
+    setDesc(S.statusLabel, text)
+end
+
+local function removeMarker()
+    if S.marker then pcall(function() S.marker:Destroy() end) S.marker = nil end
+end
+local function placeMarker()
+    removeMarker()
+    if not S.showMarker or S.unloaded then return end
+    local car = getCar()
+    if not car then return end
+    local ch = getChassis(car)
+    local route = ch and ch.Route
+    if not route then return end
+    local pos = route:PointAt(route.Length)
+    local part = Instance.new("Part")
+    part.Name = "AutoFarmFinish"
+    part.Anchored = true
+    part.CanCollide = false
+    part.Size = Vector3.new(14, 14, 1)
+    part.Transparency = 0.65
+    part.Color = Color3.fromRGB(80, 255, 140)
+    part.Material = Enum.Material.Neon
+    part.Position = pos + Vector3.new(0, 8, 0)
+    part.Parent = Workspace
+    local gui = Instance.new("BillboardGui")
+    gui.Size = UDim2.fromOffset(260, 56)
+    gui.AlwaysOnTop = true
+    gui.StudsOffset = Vector3.new(0, 10, 0)
+    gui.Parent = part
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.Text = "FINISH"
+    label.TextColor3 = Color3.fromRGB(120, 255, 170)
+    label.TextStrokeTransparency = 0.4
+    label.TextScaled = true
+    label.Font = Enum.Font.GothamBold
+    label.Parent = gui
+    S.marker = part
+end
+
+local function applyMaxSpeed()
+    if S.unloaded then return end
+    if not S.originalMaxSpd then S.originalMaxSpd = Cars.AutoDrive.MaxSpeed end
+    Cars.AutoDrive.MaxSpeed = 9999
+end
+local function restoreMaxSpeed()
+    if S.originalMaxSpd then
+        Cars.AutoDrive.MaxSpeed = S.originalMaxSpd
+        S.originalMaxSpd = nil
+    end
+end
+
+local function installDrivePatch()
+    if S.originalRead or S.unloaded then return end
+    S.originalRead = CarInput.Read
+    CarInput.Read = function()
+        if S.unloaded or not S.running then return S.originalRead() end
+        if not S.startedThisRun then return S.originalRead() end
+        local car = getCar()
+        if not car then return S.originalRead() end
+        local ch = getChassis(car)
+        if not ch then return S.originalRead() end
+        local ok, cmd = pcall(AutoDrive.Read, car, ch)
+        if ok and type(cmd) == "table" then
+            cmd.Manual = false
+            if S.mode == "Drive" then cmd.Throttle = 1 end
+            return cmd
+        end
+        return S.originalRead()
+    end
+end
+local function restoreDrivePatch()
+    if S.originalRead then
+        CarInput.Read = S.originalRead
+        S.originalRead = nil
+    end
+end
+
+local function tpTo(car, ch, dist)
+    local route = ch.Route
+    local pos = route:PointAt(math.clamp(dist, 0, route.Length - 2))
+    local body = ch.Body
+    if not body then return false end
+    pcall(function()
+        body.AssemblyLinearVelocity = Vector3.zero
+        body.AssemblyAngularVelocity = Vector3.zero
+        if ch.Force then ch.Force.Force = Vector3.zero end
+        if ch.TorqueC then ch.TorqueC.Torque = Vector3.zero end
+    end)
+    pcall(function() body.CFrame = CFrame.new(pos + Vector3.new(0, 2, 0)) * (body.CFrame - body.CFrame.Position) end)
+    pcall(function()
+        body.AssemblyLinearVelocity = Vector3.zero
+        body.AssemblyAngularVelocity = Vector3.zero
+    end)
+    return true
+end
+
+local function teleportThroughCheckpoints(car, ch)
+    local route = ch.Route
+    if not route then return false end
+    local progress = car:GetAttribute("Progress") or 0
+    local stops = {}
+    for _, d in ipairs(route.Checkpoints) do
+        if d > progress + 25 then table.insert(stops, d) end
+    end
+    table.insert(stops, route.Length - 2)
+    for _, d in ipairs(stops) do
+        if not S.running then break end
+        tpTo(car, ch, d)
+        task.wait(0.09)
+    end
+    return true
+end
+
+task.spawn(function()
+    while not S.unloaded do
+        task.wait(0.15)
+        if not S.running then continue end
+        local car = getCar()
+        if not car then
+            if os.clock() - S.lastGoAt > 3 then
+                S.lastGoAt = os.clock()
+                pcall(function() StageAction:FireServer("Go", S.stage) end)
+            end
+            continue
+        end
+        local rs = car:GetAttribute("RunState")
+        local ib = car:GetAttribute("InStartBox") == true
+        local res = LP:GetAttribute("ResultsOpen") == true
+        if res or rs == "Finished" then
+            S.tpTriggered = false
+            S.startedThisRun = false
+            S.runningSince = 0
+            task.wait(0.7)
+            if S.running and S.autoRestart then pcall(function() StageAction:FireServer(car, "Retry") end) end
+            continue
+        end
+        if ib and rs ~= "Running" and rs ~= "Countdown" then
+            S.tpTriggered = false
+            S.startedThisRun = false
+            S.runningSince = 0
+            if os.clock() - S.lastStartAt > 1.4 then
+                S.lastStartAt = os.clock()
+                pcall(function() StageAction:FireServer(car, "Start", { BrakeAssist = LP:GetAttribute("BrakeAssist") == true, Touch = false }) end)
+            end
+            continue
+        end
+        if rs == "Running" then
+            if not S.startedThisRun then
+                S.startedThisRun = true
+                S.runningSince = os.clock()
+                placeMarker()
+            end
+            local ch = getChassis(car)
+            if not ch then continue end
+            local el = os.clock() - S.runningSince
+            local m = STAGE_MIN_TIME[S.stage] or 45
+            if S.mode == "Blatant TP" and not S.tpTriggered and el >= (m - TP_BUFFER) then
+                S.tpTriggered = true
+                teleportThroughCheckpoints(car, ch)
+            end
+            continue
+        end
+        if rs == "Countdown" then
+            S.startedThisRun = false
+            S.runningSince = 0
+            S.tpTriggered = false
+            continue
+        end
+        if rs == "Idle" and not ib and not res then
+            if os.clock() - S.lastGoAt > 2.5 then
+                S.lastGoAt = os.clock()
+                pcall(function() StageAction:FireServer("Go", S.stage) end)
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while not S.unloaded do
+        task.wait(0.25)
+        if not S.gaugeLabel then continue end
+        local lvl=getLevel(); local xp=getXP(); local xpMax=getXPMax()
+        local totXp=getTotalXP(); local credits=getCredits(); local finishes=getFinishes()
+        local best=getBestTime(S.stage); local m=STAGE_MIN_TIME[S.stage] or 45
+        local car=getCar(); local ch=car and getChassis(car); local route=ch and ch.Route
+        local speed=ch and ch.State and ch.State.Speed or 0
+        local progress=car and car:GetAttribute("Progress") or 0
+        local cp=car and car:GetAttribute("Checkpoint") or 0
+        local cpTotal=route and #(route.Checkpoints) or 0
+        local pct=route and math.clamp(progress/route.Length,0,1)*100 or 0
+        local carId=car and car:GetAttribute("CarId") or "Sedan"
+        local mastery=getMasteryXP(carId)
+        local elapsed=S.startedThisRun and S.runningSince>0 and (os.clock()-S.runningSince) or 0
+        local filled=math.clamp(math.floor(xp/xpMax*20),0,20)
+        local bar=string.rep("█",filled)..string.rep("░",20-filled)
+        local lines={}
+        table.insert(lines,string.format("Level %d [%s] %d/%d XP",lvl,bar,xp,xpMax))
+        table.insert(lines,string.format("Total XP %d | Credits %d | Finishes %d",totXp,credits,finishes))
+        if S.startedThisRun and elapsed < m then
+            table.insert(lines,string.format("MinTime: %ds | Elapsed: %.1fs | TP in %.1fs",m,elapsed,math.max(0,m-TP_BUFFER-elapsed)))
+        else
+            table.insert(lines,string.format("MinTime: %ds | %s",m,fmtTime(best)))
+        end
+        table.insert(lines,string.format("%s | Mastery %s: %d XP",S.stage,carId,mastery))
+        if S.startedThisRun then table.insert(lines,string.format("Current: %s | Speed: %.0f km/h | %.0f%% | CP %d/%d",fmtTime(elapsed),speed*3.6,pct,cp,cpTotal)) end
+        setDesc(S.gaugeLabel,table.concat(lines,"\n"))
+    end
+end)
+
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+local Window = WindUI:CreateWindow({Title="Auto Farm",Author="Backseat Rally v10",Icon="flag",Folder="BackseatAutoFarm",Size=UDim2.fromOffset(580,540),Theme="Dark",Transparent=true})
+local FarmTab=Window:Tab({Title="Farm",Icon="car"})
+local DriveTab=Window:Tab({Title="Drive",Icon="navigation"})
+local MiscTab=Window:Tab({Title="Misc",Icon="settings"})
+S.gaugeLabel=FarmTab:Paragraph({Title="Gauge",Desc="Loading..."})
+S.statusLabel=FarmTab:Paragraph({Title="Status",Desc="Idle"})
+
+local farmToggle
+farmToggle=FarmTab:Toggle({Title="Auto Farm",Desc="Auto join, start, farm, retry",Value=false,Callback=function(v)
+    S.running=v
+    if v then
+        installDrivePatch()
+        if S.mode=="Drive" then applyMaxSpeed() else restoreMaxSpeed() end
+        S.tpTriggered=false;S.startedThisRun=false;S.runningSince=0
+        setStatus("Starting...")
+    else
+        S.running=false;restoreDrivePatch();restoreMaxSpeed();setStatus("Stopped")
+    end
+end})
+stopFarm=function()
+    S.running=false;restoreDrivePatch();restoreMaxSpeed();setStatus("Stopped")
+    if farmToggle then pcall(function() farmToggle:SetValue(false) end) end
+end
+
+FarmTab:Dropdown({Title="Mode",Values={"Blatant TP","Drive"},Value=S.mode,Callback=function(v)S.mode=v if S.running then if v=="Drive" then applyMaxSpeed() else restoreMaxSpeed() end end end})
+FarmTab:Dropdown({Title="Stage",Values=STAGES,Value=S.stage,Callback=function(v)S.stage=v placeMarker() end})
+
+DriveTab:Toggle({Title="Force Max Speed",Value=true,Callback=function(v) if v then applyMaxSpeed() else restoreMaxSpeed() end end})
+DriveTab:Paragraph({Title="Per-Map Timing",Desc="Pine:45s | Alpine:53s | Coastal:71s | Riverbend:91s | Sakura:46s"})
+
+MiscTab:Toggle({Title="Auto Retry",Value=true,Callback=function(v)S.autoRestart=v end})
+MiscTab:Toggle({Title="Auto Enter Car",Value=true,Callback=function(v)S.autoEnterCar=v end})
+MiscTab:Toggle({Title="Show Finish Marker",Value=true,Callback=function(v)S.showMarker=v if v then placeMarker() else removeMarker() end end})
+MiscTab:Keybind({Title="Toggle Menu",Value=S.toggleKey,Callback=function(v)local ok,c=pcall(function()return Enum.KeyCode[v]end) if ok and c then S.toggleKey=c end end})
+MiscTab:Slider({Title="TP Buffer",Value={Min=1,Max=10,Default=3},Step=1,Callback=function(v)TP_BUFFER=v end})
+MiscTab:Button({Title="Go to Stage",Callback=function()pcall(function()StageAction:FireServer("Go",S.stage)end)end})
+MiscTab:Button({Title="Unload Script",Callback=function()
+    S.unloaded=true;S.running=false;restoreDrivePatch();restoreMaxSpeed();removeMarker()
+    if S.keybindConn then S.keybindConn:Disconnect() end
+    pcall(function()Window:Destroy()end)
+    local sg=game:GetService("CoreGui"):FindFirstChild("AutoFarmToggle"); if sg then sg:Destroy() end
+end})
+
+S.keybindConn=UserInputService.InputBegan:Connect(function(inp,gp) if gp then return end if inp.KeyCode==S.toggleKey then pcall(function()Window:Toggle()end) end end)
+
+task.defer(function()
+    pcall(function()
+        task.wait(1)
+        local sg=Instance.new("ScreenGui"); sg.Name="AutoFarmToggle"; sg.ResetOnSpawn=false; sg.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; sg.Parent=game:GetService("CoreGui")
+        local btn=Instance.new("TextButton"); btn.Name="ToggleBtn"; btn.AnchorPoint=Vector2.new(1,0.5); btn.Position=UDim2.new(1,-8,0.5,0); btn.Size=UDim2.new(0,44,0,44)
+        btn.BackgroundColor3=Color3.fromRGB(30,30,30); btn.BackgroundTransparency=0.2; btn.Text="AF"; btn.TextColor3=Color3.fromRGB(120,255,170); btn.TextSize=16; btn.Font=Enum.Font.GothamBold; btn.Parent=sg
+        local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,10); c.Parent=btn
+        local st=Instance.new("UIStroke"); st.Color=Color3.fromRGB(120,255,170); st.Thickness=1.5; st.Transparency=0.3; st.Parent=btn
+        btn.MouseButton1Click:Connect(function() pcall(function()Window:Toggle()end) end)
+    end)
+end)
+
+WindUI:Notify({Title="Auto Farm v10",Content="Loaded - Pauses at start | Per-map timing",Duration=4})
