@@ -1,0 +1,822 @@
+--!nocheck
+--[[
+    Dueling Grounds - Auto Parry / God Mode / Skin Changer
+    UI: WindUI
+]]
+
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CoreGui = game:GetService("CoreGui")
+
+local WindUI = nil
+local Window = nil
+local RegisterImpact = nil
+local RequestSetCurrentWeapon = nil
+
+local State = {
+    unloaded = false,
+    autoParry = false,
+    parryChance = 100,
+    parryNotify = false,
+    godMode = false,
+    applySkin = true,
+    parried = 0,
+    dodged = 0,
+    missed = 0,
+    parryHeld = false,
+    remotesReady = false,
+}
+
+local Connections = {}
+
+local function track(connection)
+    Connections[#Connections + 1] = connection
+    return connection
+end
+
+local function report(message)
+    local text = "[Dueling Grounds] " .. tostring(message)
+    if type(warn) == "function" then
+        warn(text)
+    else
+        print(text)
+    end
+end
+
+local function notify(content, duration)
+    if not WindUI then
+        report(content)
+        return
+    end
+    pcall(function()
+        WindUI:Notify({
+            Title = "Dueling Grounds",
+            Content = content,
+            Duration = duration or 2.5,
+        })
+    end)
+end
+
+local function findChild(parent, ...)
+    local names = { ... }
+    local current = parent
+    for i = 1, #names do
+        if not current then
+            return nil
+        end
+        local ok, child = pcall(function()
+            return current:FindFirstChild(names[i])
+        end)
+        if not ok or not child then
+            return nil
+        end
+        current = child
+    end
+    return current
+end
+
+local function showFallbackError(message)
+    local ok, err = pcall(function()
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "DuelingGroundsError"
+        gui.ResetOnSpawn = false
+        gui.Parent = CoreGui
+
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(0.9, 0, 0, 170)
+        frame.Position = UDim2.new(0.05, 0, 0.38, 0)
+        frame.BackgroundColor3 = Color3.fromRGB(28, 28, 30)
+        frame.Parent = gui
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 10)
+        corner.Parent = frame
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -24, 1, -24)
+        label.Position = UDim2.fromOffset(12, 12)
+        label.BackgroundTransparency = 1
+        label.TextColor3 = Color3.fromRGB(255, 170, 60)
+        label.TextSize = 15
+        label.TextWrapped = true
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.TextYAlignment = Enum.TextYAlignment.Top
+        label.Font = Enum.Font.Gotham
+        label.Text = "Dueling Grounds\nUI failed to load:\n" .. tostring(message)
+        label.Parent = frame
+    end)
+    if not ok then
+        report("fallback error screen failed: " .. tostring(err))
+    end
+end
+
+local CharacterController = nil
+
+local function getCharacterController()
+    if CharacterController then
+        return CharacterController
+    end
+    local ok, controller = pcall(function()
+        return require(ReplicatedStorage.Controllers.CharacterController)
+    end)
+    if ok and type(controller) == "table" then
+        CharacterController = controller
+        return CharacterController
+    end
+    return nil
+end
+
+local function getCharacterHandler()
+    local controller = getCharacterController()
+    if not controller then
+        return nil
+    end
+    local ok, handler = pcall(controller.GetLocalCharacterHandler, controller)
+    if ok and type(handler) == "table" and handler.ActionManager then
+        return handler
+    end
+    return nil
+end
+
+local function getWeaponHandler(handler)
+    if not handler then
+        return nil
+    end
+    local ok, weaponHandler = pcall(function()
+        return handler:GetEquippedWeaponHandler()
+    end)
+    if ok and type(weaponHandler) == "table" then
+        return weaponHandler
+    end
+    local fallbackOk, fallback = pcall(function()
+        return handler.EquippedWeaponHandler or handler.WeaponHandler
+    end)
+    if fallbackOk and type(fallback) == "table" then
+        return fallback
+    end
+    return nil
+end
+
+local function holdImpactFlag(field, impactId, onDone)
+    local handler = getCharacterHandler()
+    if not handler then
+        return false
+    end
+    if handler[field] == true then
+        return false
+    end
+
+    local actionManager = handler.ActionManager
+    local previous = handler[field]
+
+    local setOk = pcall(function()
+        handler[field] = true
+    end)
+    if not setOk then
+        return false
+    end
+
+    task.spawn(function()
+        local deadline = os.clock() + 0.6
+
+        while true do
+            RunService.Heartbeat:Wait()
+            local pending = actionManager and actionManager.UnresolvedImpacts and actionManager.UnresolvedImpacts[impactId] ~= nil
+            if not pending or os.clock() > deadline then
+                break
+            end
+        end
+
+        local current = getCharacterHandler()
+        if current == handler and current[field] == true then
+            pcall(function()
+                current[field] = previous
+            end)
+        end
+        if onDone then
+            onDone()
+        end
+    end)
+
+    return true
+end
+
+local SKINS = {
+    Katana = {
+        "DefaultKatana",
+        "BloodlusterKatana",
+        "DeepBlueKatana",
+        "DarkMatterKatana",
+        "ChristmasKatana",
+        "FlamingKatana",
+        "ChampionKatana",
+    },
+    Daggers = {
+        "DefaultDaggers",
+        "CrimsonFangsDaggers",
+        "BronzeViperDaggers",
+        "DarkMatterDaggers",
+        "ChristmasDaggers",
+        "GoldenDaggers",
+    },
+    Naginata = {
+        "DefaultNaginata",
+        "SerpentSlayerNaginata",
+        "DeepBlueNaginata",
+        "DarkMatterNaginata",
+        "ChristmasNaginata",
+    },
+    Gauntlets = { "DefaultGauntlets", "GoldenGauntlets", "BloodlusterGauntlets" },
+    Kusarigama = { "DefaultKusarigama", "MagmaKusarigama", "BronzeViperKusarigama", "CelestialKusarigama" },
+    Warhammer = {
+        "DefaultWarhammer",
+        "IcebornWarhammer",
+        "DarkMatterWarhammer",
+        "ViperWarhammer",
+        "SoulEaterWarhammer",
+    },
+    CurvedBlades = { "DefaultCurvedBlades", "ScorchflowerCurvedBlades" },
+    BoStaff = { "DefaultBoStaff" },
+}
+
+local WeaponTypes = {}
+local SelectedSkin = {}
+
+for weaponType, skins in pairs(SKINS) do
+    table.sort(skins)
+    WeaponTypes[#WeaponTypes + 1] = weaponType
+end
+table.sort(WeaponTypes)
+
+for _, weaponType in ipairs(WeaponTypes) do
+    local fallback = SKINS[weaponType][1]
+    for _, skin in ipairs(SKINS[weaponType]) do
+        if skin:sub(1, 7) == "Default" then
+            fallback = skin
+            break
+        end
+    end
+    SelectedSkin[weaponType] = fallback
+end
+
+local AppliedCosmetics = setmetatable({}, { __mode = "k" })
+
+local function cosmeticId(skin, weaponType)
+    return (skin:gsub(weaponType, ""))
+end
+
+local function applyCosmetic(weaponHandler, cosmetic, alternativeName)
+    local cosmetics = weaponHandler.WeaponInfo and weaponHandler.WeaponInfo.Cosmetics
+    if not cosmetics then
+        return false
+    end
+
+    local target = cosmetics[cosmetic] or (alternativeName and cosmetics[alternativeName])
+    if not target then
+        return false
+    end
+
+    local ok, module = pcall(require, target)
+    if not ok or type(module) ~= "table" or not module.WeaponModel then
+        return false
+    end
+
+    local clonedOk, clone = pcall(function()
+        return module.WeaponModel:Clone()
+    end)
+    if not clonedOk or not clone then
+        return false
+    end
+
+    for _, descendant in ipairs(clone:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            descendant.CanCollide = false
+            descendant.CanQuery = false
+            descendant.CanTouch = false
+            descendant.Massless = true
+        end
+    end
+
+    local parent = weaponHandler.WeaponModel and weaponHandler.WeaponModel.Parent or weaponHandler.WeaponInstance
+
+    if weaponHandler.WeaponModel then
+        pcall(function()
+            weaponHandler.WeaponModel:Destroy()
+        end)
+    end
+
+    local blade = clone:FindFirstChild("Blade")
+    local trail = blade and blade:FindFirstChild("Trail") or nil
+    local ultimateTrail = blade and blade:FindFirstChild("UltimateTrail") or nil
+
+    if trail then
+        pcall(function()
+            trail:SetAttribute("WidthScale", trail.WidthScale)
+            trail:SetAttribute("MaxLength", trail.MaxLength)
+            trail.Enabled = false
+        end)
+    end
+
+    if ultimateTrail then
+        pcall(function()
+            ultimateTrail:SetAttribute("WidthScale", ultimateTrail.WidthScale)
+            ultimateTrail:SetAttribute("MaxLength", ultimateTrail.MaxLength)
+            ultimateTrail.Enabled = false
+        end)
+    end
+
+    pcall(function()
+        clone.Parent = parent
+    end)
+
+    pcall(function()
+        weaponHandler.WeaponModel = clone
+        weaponHandler.Blade = blade
+        weaponHandler.Trail = trail
+        weaponHandler.UltimateTrail = ultimateTrail
+        weaponHandler.CurrentCosmetic = cosmetic
+        weaponHandler.CosmeticInfo = module
+    end)
+
+    return true
+end
+
+local function applySkinNow()
+    local handler = getCharacterHandler()
+    local weaponHandler = getWeaponHandler(handler)
+    if not weaponHandler then
+        return false
+    end
+
+    local weaponType = handler.EquippedWeapon
+    local skin = SelectedSkin[weaponType]
+    if not skin then
+        return false
+    end
+
+    local cosmetic = cosmeticId(skin, weaponType)
+    if weaponHandler.CurrentCosmetic == cosmetic or AppliedCosmetics[weaponHandler] == cosmetic then
+        return true
+    end
+
+    local finished, applied = false, false
+    local thread = coroutine.create(function()
+        local callOk, result = pcall(applyCosmetic, weaponHandler, cosmetic, skin)
+        applied = callOk and result or false
+        finished = true
+    end)
+
+    pcall(setthreadcontext, thread, 8)
+    pcall(coroutine.resume, thread)
+
+    local deadline = os.clock() + 2
+    while not finished and os.clock() < deadline do
+        task.wait()
+        if not finished then
+            pcall(coroutine.resume, thread)
+        end
+    end
+
+    if applied then
+        AppliedCosmetics[weaponHandler] = cosmetic
+    end
+
+    return applied
+end
+
+local SessionLabel = nil
+local SkinLabel = nil
+local AutoParryToggle = nil
+local GodModeToggle = nil
+
+task.spawn(function()
+    local url = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+
+    local source = nil
+    for attempt = 1, 3 do
+        local fetched, result = pcall(function()
+            return game:HttpGet(url)
+        end)
+        if fetched and type(result) == "string" and #result > 100 then
+            source = result
+            break
+        end
+        if attempt < 3 then
+            task.wait(1)
+        end
+    end
+    if not source then
+        report("could not download WindUI from " .. url)
+        showFallbackError("could not download WindUI from " .. url)
+        return
+    end
+
+    local uiOk, uiError = pcall(function()
+        local loader = loadstring
+        if type(loader) ~= "function" then
+            loader = load
+        end
+        if type(loader) ~= "function" then
+            error("no script loader available in this executor")
+        end
+
+        local chunk = loader(source)
+        if type(chunk) ~= "function" then
+            error("the WindUI source could not be compiled")
+        end
+
+        WindUI = chunk()
+        if type(WindUI) ~= "table" then
+            error("WindUI did not return a library table")
+        end
+
+        Window = WindUI:CreateWindow({
+            Title = "Dueling Grounds",
+            Author = "Dueling Grounds",
+            Icon = "swords",
+            Folder = "DuelingGrounds",
+            Size = UDim2.fromOffset(600, 560),
+            Theme = "Dark",
+            Transparent = true,
+            ToggleKey = Enum.KeyCode.RightShift,
+        })
+
+        local CombatTab = Window:Tab({ Title = "Combat", Icon = "swords" })
+        local CosmeticsTab = Window:Tab({ Title = "Cosmetics", Icon = "palette" })
+        local MiscTab = Window:Tab({ Title = "Misc", Icon = "settings" })
+
+        SessionLabel = CombatTab:Paragraph({
+            Title = "Session",
+            Desc = "Parried: 0 | Dodged: 0 | Missed: 0",
+        })
+
+        AutoParryToggle = CombatTab:Toggle({
+            Title = "Auto Parry",
+            Desc = "Resolves every incoming impact as a parry. The game decides hit outcomes on your client, so this uses its own resolver instead of faking packets.",
+            Value = false,
+            Callback = function(state)
+                State.autoParry = state == true
+            end,
+        })
+
+        CombatTab:Keybind({
+            Title = "Auto Parry Key",
+            Desc = "Press to toggle auto parry on and off.",
+            Value = "G",
+            Callback = function()
+                local nextValue = not State.autoParry
+                AutoParryToggle:Set(nextValue)
+                State.autoParry = nextValue
+                notify("Auto Parry " .. (nextValue and "enabled" or "disabled"), 1.5)
+            end,
+        })
+
+        CombatTab:Slider({
+            Title = "Parry Chance",
+            Desc = "Percentage of incoming impacts the auto parry actually parries. Below 100 it rolls each hit, so it keeps looking human.",
+            Value = { Min = 1, Max = 100, Default = 100 },
+            Step = 1,
+            Callback = function(value)
+                State.parryChance = value
+            end,
+        })
+
+        CombatTab:Toggle({
+            Title = "Parry Notifications",
+            Desc = "Shows a notification for every parried impact.",
+            Value = false,
+            Callback = function(state)
+                State.parryNotify = state == true
+            end,
+        })
+
+        GodModeToggle = CombatTab:Toggle({
+            Title = "God Mode",
+            Desc = "Every incoming impact resolves as a dodge on your client, and the server accepts the result, so you take no damage.",
+            Value = false,
+            Callback = function(state)
+                State.godMode = state == true
+            end,
+        })
+
+        CombatTab:Keybind({
+            Title = "God Mode Key",
+            Desc = "Press to toggle god mode on and off.",
+            Value = "H",
+            Callback = function()
+                local nextValue = not State.godMode
+                GodModeToggle:Set(nextValue)
+                State.godMode = nextValue
+                notify("God Mode " .. (nextValue and "enabled" or "disabled"), 1.5)
+            end,
+        })
+
+        CombatTab:Button({
+            Title = "Reset Counter",
+            Callback = function()
+                State.parried = 0
+                State.dodged = 0
+                State.missed = 0
+            end,
+        })
+
+        SkinLabel = CosmeticsTab:Paragraph({
+            Title = "Current Skin",
+            Desc = "Equipped: None | Skin: None",
+        })
+
+        CosmeticsTab:Toggle({
+            Title = "Apply Skin",
+            Desc = "Client-side only: swaps the equipped weapon model to the chosen skin and re-applies it whenever the weapon remounts. The server never sees it, so locked skins work too.",
+            Value = true,
+            Callback = function(state)
+                State.applySkin = state == true
+            end,
+        })
+
+        CosmeticsTab:Button({
+            Title = "Apply Now",
+            Callback = function()
+                local handler = getCharacterHandler()
+                if not handler or not handler.EquippedWeapon then
+                    notify("No weapon equipped.", 2)
+                    return
+                end
+                if applySkinNow() then
+                    notify("Skin applied: " .. tostring(SelectedSkin[handler.EquippedWeapon]), 2)
+                else
+                    notify("Could not apply that skin.", 2)
+                end
+            end,
+        })
+
+        CosmeticsTab:Dropdown({
+            Title = "Equip Weapon",
+            Desc = "Sends the game's own Request_SetCurrentWeapon. Server validated, only weapons you own will actually equip.",
+            Values = WeaponTypes,
+            Value = WeaponTypes[1],
+            Callback = function(requestedWeapon)
+                if type(requestedWeapon) ~= "string" then
+                    return
+                end
+                if not RequestSetCurrentWeapon then
+                    notify("Game remote is not ready yet.", 2)
+                    return
+                end
+                pcall(function()
+                    RequestSetCurrentWeapon:FireServer(requestedWeapon)
+                end)
+                notify("Requested weapon: " .. requestedWeapon, 2)
+            end,
+        })
+
+        for _, weaponType in ipairs(WeaponTypes) do
+            CosmeticsTab:Dropdown({
+                Title = weaponType .. " Skin",
+                Desc = "Preview any " .. weaponType .. " skin client-side. Applies when a " .. weaponType .. " is equipped.",
+                Values = SKINS[weaponType],
+                Value = SelectedSkin[weaponType],
+                Callback = function(skin)
+                    if type(skin) ~= "string" then
+                        return
+                    end
+                    SelectedSkin[weaponType] = skin
+                    notify(weaponType .. " skin: " .. skin, 1.5)
+                end,
+            })
+        end
+
+        MiscTab:Paragraph({
+            Title = "Dueling Grounds",
+            Desc = "Auto Parry, God Mode and a client-side skin changer.",
+        })
+
+        MiscTab:Keybind({
+            Title = "Toggle Menu",
+            Desc = "Keybind used to open and close this menu.",
+            Value = "RightShift",
+            Callback = function(key)
+                local ok, code = pcall(function()
+                    return Enum.KeyCode[key]
+                end)
+                if ok and code then
+                    pcall(function()
+                        Window:SetToggleKey(code)
+                    end)
+                end
+            end,
+        })
+
+        MiscTab:Button({
+            Title = "Unload Script",
+            Callback = function()
+                State.unloaded = true
+                for _, connection in ipairs(Connections) do
+                    pcall(function()
+                        connection:Disconnect()
+                    end)
+                end
+                local handler = getCharacterHandler()
+                if handler and State.parryHeld then
+                    pcall(function()
+                        handler.IsParrying = nil
+                    end)
+                end
+                pcall(function()
+                    Window:Destroy()
+                end)
+                local toggleGui = CoreGui:FindFirstChild("DuelingGroundsToggle")
+                if toggleGui then
+                    toggleGui:Destroy()
+                end
+                local errorGui = CoreGui:FindFirstChild("DuelingGroundsError")
+                if errorGui then
+                    errorGui:Destroy()
+                end
+            end,
+        })
+        end)
+
+    if not uiOk then
+        report("UI failed to load: " .. tostring(uiError))
+        showFallbackError(uiError)
+    else
+        notify("Loaded - Auto Parry ready.", 4)
+    end
+end)
+
+local function onImpact(impactId, payload)
+    if State.unloaded or not State.autoParry then
+        return
+    end
+    if type(impactId) ~= "number" and type(impactId) ~= "string" then
+        return
+    end
+    if type(payload) == "table" and payload.sourceModule == nil then
+        return
+    end
+
+    if math.random() * 100 > State.parryChance then
+        State.missed = State.missed + 1
+        return
+    end
+
+    State.parried = State.parried + 1
+    if holdImpactFlag("IsParrying", impactId, function()
+        State.parryHeld = false
+    end) then
+        State.parryHeld = true
+    end
+
+    if State.parryNotify then
+        notify("Parried impact #" .. tostring(impactId), 1)
+    end
+end
+
+local function onDodgeImpact(impactId)
+    if State.unloaded or not State.godMode then
+        return
+    end
+    if type(impactId) ~= "number" and type(impactId) ~= "string" then
+        return
+    end
+
+    State.dodged = State.dodged + 1
+    holdImpactFlag("IsDodging", impactId)
+end
+
+local function connectImpactEvents()
+    if State.remotesReady or not RegisterImpact then
+        return
+    end
+    local ok = pcall(function()
+        track(RegisterImpact.OnClientEvent:Connect(onImpact))
+        track(RegisterImpact.OnClientEvent:Connect(onDodgeImpact))
+    end)
+    if ok then
+        State.remotesReady = true
+    end
+end
+
+task.spawn(function()
+    local attempts = 0
+    while not State.unloaded do
+        if not RegisterImpact then
+            RegisterImpact = findChild(ReplicatedStorage, "Remotes", "PlayerCharacter", "Update", "RegisterImpact")
+        end
+        if not RequestSetCurrentWeapon then
+            RequestSetCurrentWeapon = findChild(ReplicatedStorage, "Remotes", "WeaponInventory", "Request_SetCurrentWeapon")
+        end
+
+        connectImpactEvents()
+
+        if State.remotesReady and RequestSetCurrentWeapon then
+            break
+        end
+
+        attempts += 1
+        if attempts >= 15 then
+            if not State.remotesReady then
+                report("could not find RegisterImpact, auto parry and god mode stay unavailable")
+                notify("Game remotes not found - auto parry and god mode are unavailable.", 5)
+            end
+            break
+        end
+        task.wait(1)
+    end
+end)
+
+track(RunService.Heartbeat:Connect(function()
+    if State.unloaded or not State.applySkin then
+        return
+    end
+
+    local handler = getCharacterHandler()
+    if not handler then
+        return
+    end
+
+    local weaponType = handler.EquippedWeapon
+    local skin = SelectedSkin[weaponType]
+    if not skin then
+        return
+    end
+
+    local weaponHandler = getWeaponHandler(handler)
+    if not weaponHandler then
+        return
+    end
+
+    if weaponHandler.CurrentCosmetic ~= cosmeticId(skin, weaponType) then
+        pcall(applySkinNow)
+    end
+end))
+
+task.spawn(function()
+    while not State.unloaded do
+        local handler = getCharacterHandler()
+        local weaponType = handler and handler.EquippedWeapon
+
+        if SessionLabel then
+            pcall(function()
+                SessionLabel:SetDesc(
+                    string.format("Parried: %d | Dodged: %d | Missed: %d", State.parried, State.dodged, State.missed)
+                )
+            end)
+        end
+
+        if SkinLabel then
+            pcall(function()
+                SkinLabel:SetDesc(
+                    string.format(
+                        "Equipped: %s | Skin: %s",
+                        tostring(weaponType or "None"),
+                        tostring(weaponType and SelectedSkin[weaponType] or "None")
+                    )
+                )
+            end)
+        end
+
+        task.wait(0.35)
+    end
+end)
+
+task.defer(function()
+    task.wait(1)
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "DuelingGroundsToggle"
+    screenGui.ResetOnSpawn = false
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screenGui.Parent = CoreGui
+
+    local button = Instance.new("TextButton")
+    button.Name = "ToggleBtn"
+    button.AnchorPoint = Vector2.new(1, 0.5)
+    button.Position = UDim2.new(1, -8, 0.5, 0)
+    button.Size = UDim2.new(0, 44, 0, 44)
+    button.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    button.BackgroundTransparency = 0.2
+    button.Text = "DG"
+    button.TextColor3 = Color3.fromRGB(255, 170, 60)
+    button.TextSize = 16
+    button.Font = Enum.Font.GothamBold
+    button.Parent = screenGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = button
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 170, 60)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.3
+    stroke.Parent = button
+
+    button.MouseButton1Click:Connect(function()
+        pcall(function()
+            if Window then
+                Window:Toggle()
+            end
+        end)
+    end)
+end)
