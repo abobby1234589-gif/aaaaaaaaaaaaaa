@@ -1,0 +1,1324 @@
+local MAIN = [==[
+return function(SELF)
+	local Players = game:GetService("Players")
+	local HttpService = game:GetService("HttpService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	-- a queued run starts before the new DataModel hands over the player
+	local LocalPlayer = Players.LocalPlayer
+	if not LocalPlayer then
+		for _ = 1, 600 do
+			LocalPlayer = Players.LocalPlayer
+			if LocalPlayer then
+				break
+			end
+			task.wait(0.1)
+		end
+	end
+	if not LocalPlayer then
+		return function() end
+	end
+
+	local LOBBY_PLACE = 102972365566319
+	local MISSION_PLACE = 128392779339601
+	local CFG_FILE = "swat_farm_config.json"
+	local SELF_FILE = "swat_farm_self.lua"
+	local WINDUI_URL = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+
+	------------------------------------------------------------------- utils
+	local function safe(fn, ...)
+		local ok, res = pcall(fn, ...)
+		if ok then
+			return res
+		end
+		return nil
+	end
+
+	local function fmt(n)
+		local s = tostring(math.floor(tonumber(n) or 0))
+		local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+		if out:sub(1, 1) == "," then
+			out = out:sub(2)
+		end
+		return out
+	end
+
+	local function attr(inst, name)
+		return safe(function()
+			return inst:GetAttribute(name)
+		end)
+	end
+
+	------------------------------------------------ clean up older copies
+	if type(getgenv().SWATFarmStop) == "function" then
+		pcall(getgenv().SWATFarmStop)
+	end
+	local stopped = false
+	getgenv().SWATFarmStop = function()
+		stopped = true
+	end
+
+	-- WindUI cannot rebuild a window once one has been destroyed, so a rerun
+	-- wipes the library out completely and loads a fresh copy below.
+	if getgenv().SWATFarmWindow then
+		pcall(function()
+			getgenv().SWATFarmWindow:Destroy()
+		end)
+	end
+	getgenv().SWATFarmWindow = nil
+	getgenv().SWATWindUI = nil
+	pcall(function()
+		local rb = game:GetService("CoreGui"):FindFirstChild("RobloxGui")
+		local root = rb and rb:FindFirstChild("WindUI")
+		if root then
+			root:Destroy()
+		end
+	end)
+
+	------------------------------------------------------------------ config
+	local cfg = {
+		autoFarm = false,
+		killAura = true,
+		handleObjectives = true,
+		autoRetry = true,
+		map = "Riverside Depot",
+		difficulty = "Hardcore",
+		walkSpeed = 16,
+		autoExecute = true,
+		uiKey = "RightShift",
+		runs = 0,
+		clears = 0,
+		creditsBaseline = nil,
+		xpBaseline = nil,
+		lastResult = "",
+	}
+
+	local function loadCfg()
+		local raw = safe(readfile, CFG_FILE)
+		if type(raw) == "string" then
+			local ok, data = pcall(HttpService.JSONDecode, HttpService, raw)
+			if ok and type(data) == "table" then
+				for k, v in pairs(data) do
+					cfg[k] = v
+				end
+				-- older builds called this instantKill
+				if cfg.killAura == nil then
+					cfg.killAura = data.instantKill ~= false
+				end
+			end
+		end
+		if cfg.creditsBaseline == nil then
+			cfg.creditsBaseline = tonumber(attr(LocalPlayer, "Credits")) or 0
+		end
+		if cfg.xpBaseline == nil then
+			cfg.xpBaseline = tonumber(attr(LocalPlayer, "XP")) or 0
+		end
+	end
+
+	local function saveCfg()
+		safe(writefile, CFG_FILE, HttpService:JSONEncode(cfg))
+	end
+
+	---------------------------------------------------------------------- ui
+	local function windRoot()
+		local rb = game:GetService("CoreGui"):FindFirstChild("RobloxGui")
+		return rb and rb:FindFirstChild("WindUI")
+	end
+
+	-- Hiding the ScreenGui keeps the library state intact, so the keybind can
+	-- bring the same window back instead of rebuilding it.
+	local function toggleUI()
+		local root = windRoot()
+		if not root then
+			return false
+		end
+		root.Enabled = not root.Enabled
+		return root.Enabled
+	end
+
+	local function uninject()
+		cfg.autoFarm = false
+		saveCfg()
+		if type(getgenv().SWATFarmStop) == "function" then
+			pcall(getgenv().SWATFarmStop)
+		end
+		-- neutralise the queued re-run so it cannot come back after a teleport
+		pcall(writefile, SELF_FILE, "return function() end")
+		pcall(queue_on_teleport, "return")
+		if getgenv().SWATFarmWindow then
+			pcall(function()
+				getgenv().SWATFarmWindow:Destroy()
+			end)
+		end
+		getgenv().SWATFarmWindow = nil
+		pcall(function()
+			local rb = game:GetService("CoreGui"):FindFirstChild("RobloxGui")
+			local root = rb and rb:FindFirstChild("WindUI")
+			if root then
+				root:Destroy()
+			end
+		end)
+		getgenv().SWATWindUI = nil
+		getgenv().SWATFarmStop = nil
+	end
+
+	local UI = {
+		status = nil,
+		live = nil,
+		info = nil,
+		mapDropdown = nil,
+		diffDropdown = nil,
+		farmToggle = nil,
+		killToggle = nil,
+		objToggle = nil,
+		retryToggle = nil,
+		walkSlider = nil,
+		autoExecToggle = nil,
+		keybind = nil,
+	}
+
+	local function setStatus(text)
+		if UI.status then
+			pcall(function()
+				UI.status:SetDesc(text)
+			end)
+		end
+		if UI.live and game.PlaceId ~= LOBBY_PLACE then
+			pcall(function()
+				UI.live:SetDesc(text)
+			end)
+		end
+	end
+
+	local function refreshInfo()
+		if not UI.info then
+			return
+		end
+		local credits = tonumber(attr(LocalPlayer, "Credits")) or 0
+		local xp = tonumber(attr(LocalPlayer, "XP")) or 0
+		local gained = credits - (tonumber(cfg.creditsBaseline) or credits)
+		local xpGained = xp - (tonumber(cfg.xpBaseline) or xp)
+		local text = string.format(
+			"Level %s   ·   XP %s  (+%s)\nCredits %s  (+%s)\nDeployments %s   ·   Clears %s\nLast: %s",
+			tostring(attr(LocalPlayer, "Level") or "?"),
+			fmt(xp),
+			fmt(xpGained),
+			fmt(credits),
+			fmt(gained),
+			tostring(cfg.runs or 0),
+			tostring(cfg.clears or 0),
+			(cfg.lastResult ~= "" and cfg.lastResult) or "—"
+		)
+		pcall(function()
+			UI.info:SetDesc(text)
+		end)
+	end
+
+	------------------------------------------------------------- game access
+	local function gameFolder(wait)
+		return ReplicatedStorage:FindFirstChild("Game") or ReplicatedStorage:WaitForChild("Game", wait or 20)
+	end
+
+	local function eventos()
+		local g = gameFolder(20)
+		return g and (g:FindFirstChild("Eventos") or g:WaitForChild("Eventos", 15))
+	end
+
+	local function partyRemote()
+		local e = eventos()
+		return e and (e:FindFirstChild("Party") or e:WaitForChild("Party", 10))
+	end
+
+	local function statsFolder(wait)
+		local g = gameFolder(wait or 20)
+		return g and (g:FindFirstChild("GameStats") or g:WaitForChild("GameStats", wait or 20))
+	end
+
+	local function timersFolder(wait)
+		local g = gameFolder(wait or 20)
+		return g and (g:FindFirstChild("Timers") or g:WaitForChild("Timers", wait or 20))
+	end
+
+	local function roundActive()
+		local t = timersFolder(5)
+		return t ~= nil and tostring(t.Mode.Value) == "Round"
+	end
+
+	-------------------------------------------------------- mission catalogue
+	-- Backed by ReplicatedStorage.Game.MissionList, whose API gives us the
+	-- display title, required level, pass gate and the exact lock reason.
+	local missionModule = nil
+
+	local function getMissionModule()
+		if missionModule then
+			return missionModule
+		end
+		local g = gameFolder(20)
+		local module = g and g:FindFirstChild("MissionList")
+		if module then
+			local ok, data = pcall(require, module)
+			if ok and type(data) == "table" and type(data.Missions) == "table" then
+				missionModule = data
+			end
+		end
+		return missionModule
+	end
+
+	local LOCK_TEXT = {
+		Pass = "needs the gamepass",
+		Tutorial = "finish the tutorial",
+		Mission = "clear the previous mission",
+		Level = "level too low",
+	}
+
+	local function missionEntries()
+		local M = getMissionModule()
+		local out = {}
+		if M then
+			for _, mission in ipairs(M.Missions) do
+				local entry = {
+					map = mission.Map,
+					title = mission.Title or mission.Map,
+					level = safe(function()
+						return M.RequiredLevel(mission)
+					end) or 1,
+					pass = mission.Pass,
+					training = mission.Training == true,
+					description = mission.Description,
+					after = safe(function()
+						return M.RequiredTitle(mission)
+					end),
+				}
+				entry.lock = safe(function()
+					return M.LockReason(mission, LocalPlayer)
+				end)
+				if entry.map then
+					out[#out + 1] = entry
+				end
+			end
+		end
+
+		if #out == 0 then
+			for _, name in ipairs({ "Riverside Depot", "Gas Station", "Alleway", "Bank", "Mansion", "Hollywood Hills",
+				"Campsite", "Warehouse District", "Dike", "Laboratory", "Employees Tunnel", "Skyline Tower" }) do
+				out[#out + 1] = { map = name, title = name, level = 1 }
+			end
+		end
+
+		table.sort(out, function(a, b)
+			local al, bl = a.lock ~= nil, b.lock ~= nil
+			if al ~= bl then
+				return not al
+			end
+			if a.level ~= b.level then
+				return a.level < b.level
+			end
+			return a.title < b.title
+		end)
+		return out
+	end
+
+	local function findEntry(entries, map)
+		for _, entry in ipairs(entries) do
+			if entry.map == map then
+				return entry
+			end
+		end
+		return nil
+	end
+
+	local function lockText(entry)
+		if not entry or not entry.lock then
+			return nil
+		end
+		if entry.lock == "Level" then
+			return string.format("Lv %s required", tostring(entry.level))
+		end
+		if entry.lock == "Pass" then
+			return string.format("%s pass", tostring(entry.pass or "game"))
+		end
+		return LOCK_TEXT[entry.lock] or tostring(entry.lock)
+	end
+
+	local function entryLabel(entry)
+		local lock = lockText(entry)
+		if lock then
+			return string.format("%s  ·  🔒 %s", entry.title, lock)
+		end
+		return string.format("%s  ·  Lv %s", entry.title, tostring(entry.level))
+	end
+
+	local function difficultyLocked(difficulty)
+		local M = getMissionModule()
+		if not M then
+			return false
+		end
+		return safe(function()
+			return M.DifficultyLocked(difficulty, LocalPlayer)
+		end) == true
+	end
+
+	-- highest difficulty this account is actually allowed to queue
+	local function bestDifficulty()
+		for _, name in ipairs({ "Hardcore", "Hard", "Normal" }) do
+			if not difficultyLocked(name) then
+				return name
+			end
+		end
+		return "Normal"
+	end
+
+	------------------------------------------------------ cross teleport hop
+	-- The runner waits for the new place to come up first: a queue fires a
+	-- frame or two before LocalPlayer and PlaceId are trustworthy, and an
+	-- early start used to crash in the middle of the lobby path.
+	local SHORT_RUNNER = table.concat({
+		"local P = game:GetService(\"Players\")",
+		"local lp = P.LocalPlayer",
+		"local n = 0",
+		"while not lp and n < 900 do",
+		"    task.wait(0.1)",
+		"    lp = P.LocalPlayer",
+		"    n = n + 1",
+		"end",
+		"if not lp then return end",
+		"local p0 = game.PlaceId",
+		"local t0 = os.clock()",
+		"while os.clock() - t0 < 6 do",
+		"    task.wait(0.25)",
+		"    if game.PlaceId ~= p0 then",
+		"        p0 = game.PlaceId",
+		"        t0 = os.clock()",
+		"    end",
+		"end",
+		"local s = readfile(\"swat_farm_self.lua\")",
+		"if type(s) ~= \"string\" then return end",
+		"local f = loadstring(s)",
+		"if not f then return end",
+		"local ok, g = pcall(f)",
+		"if ok and type(g) == \"function\" then pcall(g, s) end",
+	}, "\n")
+
+	local function queueSelf()
+		if cfg.autoExecute == false then
+			return false
+		end
+		pcall(writefile, SELF_FILE, SELF)
+		local back = safe(readfile, SELF_FILE)
+		if type(back) == "string" and #back == #SELF then
+			if pcall(queue_on_teleport, SHORT_RUNNER) then
+				return true
+			end
+		end
+		-- write failed: embed the source instead
+		local quoted = string.format("%q", SELF)
+		local ok = pcall(queue_on_teleport,
+			"local f = loadstring(" .. quoted .. ")\nif f then local g = f()\nif g then g(" .. quoted .. ") end end")
+		return ok
+	end
+
+	-------------------------------------------------------------- gun engine
+	local gunCache = nil
+	local function gunEnv()
+		if gunCache then
+			return gunCache
+		end
+		local pg = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 20)
+		local ge = pg and (pg:FindFirstChild("GunEngineClient") or pg:WaitForChild("GunEngineClient", 30))
+		if not ge then
+			return nil
+		end
+		local ok, env = pcall(getsenv, ge)
+		if ok and type(env) == "table" and type(env.BulletDamage) == "function" then
+			gunCache = env
+			return env
+		end
+		return nil
+	end
+
+	local function isHostile(npc)
+		if npc:GetAttribute("Civilian") == true then
+			return false
+		end
+		if npc:GetAttribute("Hostage") == true then
+			return false
+		end
+		local h = npc:FindFirstChildOfClass("Humanoid")
+		return h ~= nil and h.Health > 0
+	end
+
+	local function killHostiles()
+		local env = gunEnv()
+		local npcs = workspace:FindFirstChild("NPCs")
+		if not (env and npcs) then
+			return 0
+		end
+		local hit = 0
+		for _, npc in ipairs(npcs:GetChildren()) do
+			if isHostile(npc) then
+				local head = npc:FindFirstChild("Head")
+				local humanoid = npc:FindFirstChildOfClass("Humanoid")
+				if head and humanoid then
+					pcall(env.BulletDamage, head, 250, false)
+					pcall(env.BulletDamage, head, 250, false)
+					hit += 1
+				end
+			end
+		end
+		return hit
+	end
+
+	----------------------------------------------------------- walk speed
+	local function applyWalkSpeed()
+		local speed = tonumber(cfg.walkSpeed) or 16
+		local char = LocalPlayer.Character
+		local h = char and char:FindFirstChildOfClass("Humanoid")
+		if h and speed > 0 then
+			h.WalkSpeed = speed
+		end
+	end
+
+	local function watchWalkSpeed()
+		task.spawn(function()
+			while not stopped do
+				task.wait(0.4)
+				local speed = tonumber(cfg.walkSpeed) or 16
+				if speed ~= 16 then
+					applyWalkSpeed()
+				end
+			end
+		end)
+	end
+
+	------------------------------------------------------- objective handling
+	local INTEREST = {
+		"interact", "action", "cuff", "secure", "rescue", "free",
+		"grab", "untie", "escort", "evidence", "collect", "pickup", "hold",
+	}
+
+	local function rootOf(inst)
+		if inst:IsA("BasePart") then
+			return inst
+		end
+		return inst:FindFirstChild("HumanoidRootPart") or inst:FindFirstChildWhichIsA("BasePart")
+	end
+
+	local function moveTo(inst)
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		local part = rootOf(inst)
+		if not (hrp and part) then
+			return false
+		end
+		local pos = part.Position
+		hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, -3))
+		pcall(function()
+			hrp.AssemblyLinearVelocity = Vector3.zero
+		end)
+		task.wait(0.25)
+		return true
+	end
+
+	local function usePrompts(inst)
+		local used = 0
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA("ProximityPrompt") and d.Enabled then
+				pcall(function()
+					d:InputHoldBegin()
+				end)
+				used += 1
+				task.wait(math.clamp(d.HoldDuration + 0.2, 0.3, 3.5))
+				pcall(function()
+					d:InputHoldEnd()
+				end)
+				task.wait(0.2)
+			end
+		end
+		return used
+	end
+
+	-- Interaction protocol, taken from PlayerScripts.InteractionController:
+	--   Shout:FireServer()                  -- shout at whatever is nearby
+	--   Cuff:FireServer(model, "Begin")     -- start the 1.5s cuff hold
+	--   Cuff:FireServer(model, "Finish")    -- complete it
+	--   SecureEvidence:FireServer(model)    -- evidence pickup
+	local function eventosRemote(name)
+		local e = eventos()
+		return e and e:FindFirstChild(name)
+	end
+
+	local function cuffEntity(npc)
+		local cuff = eventosRemote("Cuff")
+		local shout = eventosRemote("Shout")
+		if not (cuff and moveTo(npc)) then
+			return false
+		end
+		if shout then
+			pcall(function()
+				shout:FireServer()
+			end)
+			task.wait(0.25)
+		end
+		pcall(function()
+			cuff:FireServer(npc, "Begin")
+		end)
+		task.wait(1.55)
+		pcall(function()
+			cuff:FireServer(npc, "Finish")
+		end)
+		task.wait(0.25)
+		return true
+	end
+
+	local function secureEvidenceItem(item)
+		local remote = eventosRemote("SecureEvidence")
+		if not (remote and moveTo(item)) then
+			return false
+		end
+		pcall(function()
+			remote:FireServer(item)
+		end)
+		task.wait(0.25)
+		return true
+	end
+
+	local function pendingHostages()
+		local npcs = workspace:FindFirstChild("NPCs")
+		local out = {}
+		if not npcs then
+			return out
+		end
+		for _, npc in ipairs(npcs:GetChildren()) do
+			local h = npc:FindFirstChildOfClass("Humanoid")
+			if npc:GetAttribute("Hostage") == true and (not h or h.Health > 0) then
+				out[#out + 1] = npc
+			end
+		end
+		return out
+	end
+
+	local function pendingCivilians()
+		local npcs = workspace:FindFirstChild("NPCs")
+		local out = {}
+		if not npcs then
+			return out
+		end
+		for _, npc in ipairs(npcs:GetChildren()) do
+			if npc:GetAttribute("Civilian") == true then
+				local h = npc:FindFirstChildOfClass("Humanoid")
+				local state = tostring(npc:GetAttribute("State") or "")
+				if h and h.Health > 0 and state ~= "Secured" and state ~= "Cuffed" then
+					out[#out + 1] = npc
+				end
+			end
+		end
+		return out
+	end
+
+	local function pendingEvidence()
+		local folder = workspace:FindFirstChild("Evidence")
+		if not folder then
+			return {}
+		end
+		return folder:GetChildren()
+	end
+
+	local function handleObjectives(stats)
+		if not cfg.handleObjectives then
+			return false
+		end
+
+		for _, item in ipairs(pendingEvidence()) do
+			if stopped or not roundActive() then
+				return true
+			end
+			setStatus("Securing evidence")
+			secureEvidenceItem(item)
+		end
+
+		for _, npc in ipairs(pendingHostages()) do
+			if stopped or not roundActive() then
+				return true
+			end
+			setStatus("Freeing a hostage")
+			cuffEntity(npc)
+		end
+
+		local secured = tonumber(attr(stats, "CiviliansSecured")) or 0
+		local total = tonumber(attr(stats, "CiviliansTotal")) or 0
+		if total > 0 and secured >= total then
+			return false
+		end
+		for _, npc in ipairs(pendingCivilians()) do
+			if stopped or not roundActive() then
+				return true
+			end
+			setStatus("Securing a civilian")
+			cuffEntity(npc)
+		end
+
+		return false
+	end
+
+	-------------------------------------------------------------- mission run
+	local function missionWorker()
+		queueSelf()
+
+		local g = gameFolder(90)
+		if not g then
+			return
+		end
+		local stats = statsFolder(60)
+		local timers = timersFolder(60)
+		if not (stats and timers) then
+			return
+		end
+
+		setStatus("Arrived — waiting for the round to start")
+		local t0 = os.clock()
+		while not stopped and os.clock() - t0 < 120 and tostring(timers.Mode.Value) ~= "Round" do
+			task.wait(0.3)
+		end
+		if stopped then
+			return
+		end
+		local startCredits = 0
+		local startXp = 0
+		local mode = "?"
+		local mapName = "?"
+
+		if tostring(timers.Mode.Value) ~= "Round" then
+			setStatus("Round never started")
+		else
+			mode = tostring(attr(stats, "MissionMode") or "?")
+			mapName = tostring(attr(stats, "MissionMap") or "?")
+			local hostiles = tonumber(attr(stats, "HostilesTotal")) or 0
+			setStatus(string.format("%s · %s · %d hostiles", mode, mapName, hostiles))
+
+			startCredits = tonumber(attr(LocalPlayer, "Credits")) or 0
+			startXp = tonumber(attr(LocalPlayer, "XP")) or 0
+			local deadline = os.clock() + 180
+			local lastProgress = os.clock()
+			local lastCiv = tonumber(attr(stats, "CiviliansSecured")) or 0
+			local lastHos = tonumber(attr(stats, "HostagesRescued")) or 0
+			local bailed = false
+
+			while not stopped and os.clock() < deadline and tostring(timers.Mode.Value) == "Round" do
+				local left = tonumber(attr(stats, "HostilesLeft")) or 0
+
+				-- kill aura: hostiles only, civilians and hostages are skipped
+				if cfg.killAura and left > 0 then
+					local hit = killHostiles()
+					if hit > 0 then
+						setStatus(string.format("%s · %s · %d hostiles left", mode, mapName, left))
+					end
+				end
+
+				if left <= 0 then
+					handleObjectives(stats)
+				end
+
+				local civ = tonumber(attr(stats, "CiviliansSecured")) or 0
+				local hos = tonumber(attr(stats, "HostagesRescued")) or 0
+				if civ ~= lastCiv or hos ~= lastHos then
+					lastCiv, lastHos = civ, hos
+					lastProgress = os.clock()
+				end
+				if left > 0 then
+					lastProgress = os.clock()
+				end
+
+				-- nothing moved for a long time and no hostiles are left: give up on this one
+				if os.clock() - lastProgress > 45 then
+					setStatus("Objectives stalled — retrying this mission")
+					break
+				end
+
+				task.wait(0.2)
+			end
+
+			local cleared = tostring(timers.Mode.Value) ~= "Round"
+			if cleared then
+				cfg.clears = (tonumber(cfg.clears) or 0) + 1
+			elseif cfg.autoRetry == false then
+				cfg.autoFarm = false
+			end
+		end
+
+		-- The after-match summary can sit there for a while. Wait only for the
+		-- payout to actually land, then leave on our own.
+		local paid = false
+		local pd = os.clock() + 10
+		while os.clock() < pd and game.PlaceId ~= LOBBY_PLACE do
+			if (tonumber(attr(LocalPlayer, "Credits")) or 0) ~= startCredits
+				or (tonumber(attr(LocalPlayer, "XP")) or 0) ~= startXp then
+				paid = true
+				break
+			end
+			task.wait(0.2)
+		end
+
+		local gained = (tonumber(attr(LocalPlayer, "Credits")) or 0) - startCredits
+		local xpGained = (tonumber(attr(LocalPlayer, "XP")) or 0) - startXp
+		if paid or gained ~= 0 or xpGained ~= 0 then
+			cfg.lastResult = string.format("%s · %s · +%s cr / +%s xp", mode, mapName, fmt(gained), fmt(xpGained))
+			setStatus("Mission cleared — returning to HQ")
+		else
+			cfg.lastResult = string.format("%s · %s · not completed", mode, mapName)
+			setStatus("Mission not completed — returning to HQ")
+		end
+		saveCfg()
+		refreshInfo()
+
+		-- short grace for the server's own return, then go back ourselves
+		local b0 = os.clock()
+		while os.clock() - b0 < 3 do
+			if game.PlaceId == LOBBY_PLACE then
+				return
+			end
+			task.wait(0.25)
+		end
+		if game.PlaceId ~= LOBBY_PLACE then
+			setStatus("Returning to HQ")
+			queueSelf()
+			pcall(function()
+				game:GetService("TeleportService"):Teleport(LOBBY_PLACE)
+			end)
+		end
+	end
+
+	------------------------------------------------------------------- lobby
+	local running = false
+
+	local function ensureParty()
+		if attr(LocalPlayer, "Party") then
+			return true
+		end
+		local lobby = workspace:FindFirstChild("Lobby") or workspace:WaitForChild("Lobby", 30)
+		local createLobby = lobby and lobby:FindFirstChild("CreateLobby")
+		if not createLobby then
+			setStatus("Lobby pads not found")
+			return false
+		end
+		local pad = nil
+		for _, entry in ipairs(createLobby:GetChildren()) do
+			local e = entry:FindFirstChild("Enter")
+			if e then
+				pad = e
+				break
+			end
+		end
+		if not pad then
+			setStatus("Lobby pad not found")
+			return false
+		end
+
+		local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+		local hrp = character and character:WaitForChild("HumanoidRootPart", 15)
+		if not hrp then
+			return false
+		end
+
+		for _ = 1, 40 do
+			if stopped then
+				return false
+			end
+			hrp.CFrame = pad.CFrame + Vector3.new(0, 3, 0)
+			pcall(firetouchinterest, pad, hrp, 0)
+			task.wait(0.1)
+			pcall(firetouchinterest, pad, hrp, 1)
+			task.wait(0.3)
+			if attr(LocalPlayer, "Party") then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function deploy(map, difficulty)
+		local entry = findEntry(missionEntries(), map)
+		local lock = lockText(entry)
+		if lock then
+			setStatus(string.format("%s is locked — %s", tostring(map), lock))
+			return false, "locked"
+		end
+		if difficultyLocked(difficulty) then
+			local fallback = bestDifficulty()
+			setStatus(string.format("%s is locked — using %s", tostring(difficulty), fallback))
+			difficulty = fallback
+		end
+
+		setStatus("Building a squad")
+		if not ensureParty() then
+			setStatus("Could not create a squad")
+			return false
+		end
+
+		local party = partyRemote()
+		if not party then
+			setStatus("Party remote not found")
+			return false
+		end
+
+		local state = nil
+		local conn = party.OnClientEvent:Connect(function(command, data)
+			if command == "State" and type(data) == "table" then
+				state = data
+			end
+		end)
+
+		local function configure()
+			pcall(function()
+				party:FireServer("Configure", { Map = map, Difficulty = difficulty, PartySize = 1 })
+			end)
+		end
+
+		local function waitReady(seconds)
+			local t = os.clock()
+			while os.clock() - t < seconds do
+				if state and state.Status == "Ready" then
+					return true
+				end
+				task.wait(0.2)
+			end
+			return false
+		end
+
+		configure()
+		if not waitReady(12) then
+			configure()
+			waitReady(10)
+		end
+
+		local ready = state ~= nil and state.Status == "Ready"
+		local ok = false
+		if ready then
+			queueSelf()
+			ok = pcall(function()
+				party:FireServer("Start")
+			end)
+			cfg.runs = (tonumber(cfg.runs) or 0) + 1
+			saveCfg()
+			refreshInfo()
+			setStatus(string.format("Deploying to %s (%s)", map, difficulty))
+		else
+			setStatus("Squad never became ready")
+		end
+
+		conn:Disconnect()
+		return ready and ok
+	end
+
+	local function waitTeleport(seconds)
+		local t = os.clock()
+		while os.clock() - t < (seconds or 40) do
+			task.wait(0.25)
+			if game.PlaceId ~= LOBBY_PLACE then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function farmLoop()
+		if running then
+			return
+		end
+		running = true
+		task.spawn(function()
+			local attempts = 0
+			while cfg.autoFarm and not stopped do
+				if game.PlaceId ~= LOBBY_PLACE then
+					break
+				end
+				local ok, why = deploy(cfg.map, cfg.difficulty)
+				if ok then
+					waitTeleport(45)
+					break
+				end
+				if why == "locked" or why == "difficulty" then
+					cfg.autoFarm = false
+					saveCfg()
+					pcall(function()
+						if UI.farmToggle then
+							UI.farmToggle:Set(false)
+						end
+					end)
+					break
+				end
+				attempts += 1
+				if attempts >= 4 then
+					cfg.autoFarm = false
+					saveCfg()
+					setStatus("Giving up after 4 failed deployments")
+					break
+				end
+				setStatus(string.format("Retrying deployment (%d/4)", attempts))
+				task.wait(3)
+			end
+			running = false
+		end)
+	end
+
+	---------------------------------------------------------------------- ui
+	local function buildMenu(entries)
+		local WindUI = getgenv().SWATWindUI
+		if not WindUI then
+			local ok, res = pcall(function()
+				return loadstring(game:HttpGet(WINDUI_URL, true))()
+			end)
+			if ok and type(res) == "table" then
+				WindUI = res
+				getgenv().SWATWindUI = res
+			end
+		end
+		if not WindUI then
+			warn("[SWAT Farm] WindUI failed to load — farming still works without the menu")
+			return
+		end
+
+		local Window = WindUI:CreateWindow({
+			Title = "SWAT Auto Farm",
+			Icon = "shield",
+			Folder = "SWATFarm",
+			Size = UDim2.fromOffset(560, 470),
+			Theme = "Dark",
+		})
+		getgenv().SWATFarmWindow = Window
+
+		local farmTab = Window:Tab({ Title = "Farm", Icon = "solar:play-circle-bold" })
+		local miscTab = Window:Tab({ Title = "Misc", Icon = "solar:settings-bold" })
+		local statsTab = Window:Tab({ Title = "Stats", Icon = "solar:chart-2-bold" })
+
+		-- WindUI does not select the first tab on its own here, and an
+		-- unselected tab keeps its content hidden.
+		pcall(function()
+			farmTab:Select()
+		end)
+
+		local function space(tab)
+			pcall(function()
+				tab:Space()
+			end)
+		end
+
+		local function divider(tab)
+			pcall(function()
+				tab:Divider()
+			end)
+		end
+
+		local labels = {}
+		local mapByLabel = {}
+		for _, entry in ipairs(entries) do
+			local label = entryLabel(entry)
+			labels[#labels + 1] = label
+			mapByLabel[label] = entry.map
+		end
+		local function labelForMap(name)
+			for label, map in pairs(mapByLabel) do
+				if map == name then
+					return label
+				end
+			end
+			return labels[1]
+		end
+
+		UI.mapDropdown = farmTab:Dropdown({
+			Title = "Map",
+			Desc = "Locked maps say why they are locked",
+			Values = labels,
+			Value = labelForMap(cfg.map),
+			Callback = function(selected)
+				cfg.map = mapByLabel[selected] or selected
+				saveCfg()
+			end,
+		})
+
+		space(farmTab)
+
+		UI.diffDropdown = farmTab:Dropdown({
+			Title = "Difficulty",
+			Desc = "Hardcore unlocks at level 5",
+			Values = { "Normal", "Hard", "Hardcore" },
+			Value = cfg.difficulty,
+			Callback = function(selected)
+				cfg.difficulty = selected
+				saveCfg()
+			end,
+		})
+
+		divider(farmTab)
+
+		UI.killToggle = farmTab:Toggle({
+			Title = "Kill aura",
+			Desc = "Auto-kills hostiles only — never civilians or hostages",
+			Default = cfg.killAura ~= false,
+			Callback = function(value)
+				cfg.killAura = value
+				saveCfg()
+			end,
+		})
+
+		UI.objToggle = farmTab:Toggle({
+			Title = "Secondary objectives",
+			Desc = "Hostages, civilians and evidence once the shooting stops",
+			Default = cfg.handleObjectives,
+			Callback = function(value)
+				cfg.handleObjectives = value
+				saveCfg()
+			end,
+		})
+
+		UI.retryToggle = farmTab:Toggle({
+			Title = "Auto retry",
+			Desc = "Redeploy the same map if a run does not complete",
+			Default = cfg.autoRetry ~= false,
+			Callback = function(value)
+				cfg.autoRetry = value
+				saveCfg()
+			end,
+		})
+
+		UI.farmToggle = farmTab:Toggle({
+			Title = "Auto farm",
+			Desc = "Loop missions until switched off",
+			Default = cfg.autoFarm,
+			Callback = function(value)
+				cfg.autoFarm = value
+				saveCfg()
+				if value then
+					if game.PlaceId ~= LOBBY_PLACE then
+						queueSelf()
+					else
+						farmLoop()
+					end
+				else
+					setStatus("Auto farm off")
+				end
+			end,
+		})
+
+		divider(farmTab)
+
+		farmTab:Button({
+			Title = "Deploy once now",
+			Justify = "Center",
+			Icon = "solar:rocket-2-bold",
+			Callback = function()
+				if running or game.PlaceId ~= LOBBY_PLACE then
+					return
+				end
+				task.spawn(function()
+					if deploy(cfg.map, cfg.difficulty) then
+						waitTeleport(45)
+					end
+				end)
+			end,
+		})
+
+		space(farmTab)
+
+		farmTab:Button({
+			Title = "Reset session counters",
+			Justify = "Center",
+			Icon = "solar:restart-bold",
+			Callback = function()
+				cfg.autoFarm = false
+				cfg.runs = 0
+				cfg.clears = 0
+				cfg.lastResult = ""
+				cfg.creditsBaseline = tonumber(attr(LocalPlayer, "Credits")) or 0
+				cfg.xpBaseline = tonumber(attr(LocalPlayer, "XP")) or 0
+				saveCfg()
+				pcall(function()
+					if UI.farmToggle then
+						UI.farmToggle:Set(false)
+					end
+				end)
+				setStatus("Stopped")
+				refreshInfo()
+			end,
+		})
+
+		divider(farmTab)
+
+		UI.status = farmTab:Paragraph({ Title = "State", Desc = "Idle" })
+		UI.live = farmTab:Paragraph({ Title = "Live", Desc = "—" })
+
+		pcall(function()
+			farmTab:Select()
+		end)
+
+		-- misc tab
+		UI.keybind = miscTab:Keybind({
+			Title = "Hide menu",
+			Desc = "Press to show or hide this window",
+			Value = cfg.uiKey or "RightShift",
+			Callback = function()
+				toggleUI()
+				pcall(function()
+					if UI.keybind and UI.keybind.Value then
+						cfg.uiKey = UI.keybind.Value
+						saveCfg()
+					end
+				end)
+			end,
+		})
+
+		divider(miscTab)
+
+		UI.walkSlider = miscTab:Slider({
+			Title = "Walk speed",
+			Desc = "16 is normal, higher is faster",
+			Step = 1,
+			Value = {
+				Min = 16,
+				Max = 120,
+				Default = tonumber(cfg.walkSpeed) or 16,
+			},
+			Callback = function(value)
+				cfg.walkSpeed = value
+				applyWalkSpeed()
+				saveCfg()
+			end,
+		})
+
+		divider(miscTab)
+
+		UI.autoExecToggle = miscTab:Toggle({
+			Title = "Auto execute",
+			Desc = "Re-runs this script after every teleport",
+			Default = cfg.autoExecute ~= false,
+			Callback = function(value)
+				cfg.autoExecute = value
+				saveCfg()
+			end,
+		})
+
+		divider(miscTab)
+
+		miscTab:Button({
+			Title = "Uninject script",
+			Desc = "Stops the farm and removes the menu",
+			Justify = "Center",
+			Icon = "solar:logout-2-bold",
+			Callback = function()
+				uninject()
+			end,
+		})
+
+		UI.info = statsTab:Paragraph({ Title = "Account", Desc = "" })
+		refreshInfo()
+
+		divider(statsTab)
+
+		statsTab:Paragraph({
+			Title = "Credits",
+			Desc = "Discord: abobby1234589",
+		})
+
+		pcall(function()
+			Window:Tag({
+				Title = "v1.3",
+				Icon = "solar:bolt-bold",
+				Color = Color3.fromHex("#1c1c1c"),
+				Border = true,
+			})
+		end)
+	end
+
+	---------------------------------------------------------------------- run
+	loadCfg()
+
+	local inLobby = game.PlaceId == LOBBY_PLACE
+
+	-- the menu is a bonus, never a dependency: if WindUI fails to download the
+	-- farm half still has to run
+	local entries = select(2, pcall(missionEntries)) or {}
+	if type(entries) ~= "table" then
+		entries = {}
+	end
+	if not getgenv().SWATFarmWindow then
+		local okMenu, menuErr = pcall(buildMenu, entries)
+		if not okMenu then
+			warn("[SWAT Farm] menu failed: " .. tostring(menuErr))
+		end
+	end
+	setStatus(cfg.autoFarm and "Resuming auto farm"
+		or (inLobby and "Idle — pick a map and press Deploy" or "Mission in progress"))
+
+	for _, name in ipairs({ "Credits", "XP", "Level" }) do
+		pcall(function()
+			LocalPlayer:GetAttributeChangedSignal(name):Connect(refreshInfo)
+		end)
+	end
+
+	applyWalkSpeed()
+	watchWalkSpeed()
+	pcall(function()
+		LocalPlayer.CharacterAdded:Connect(function()
+			task.wait(0.6)
+			applyWalkSpeed()
+		end)
+	end)
+
+	-- tiny control surface so the menu binds and a console can drive it
+	getgenv().SWATFarm = {
+		deploy = function(map, diff)
+			return deploy(map or cfg.map, diff or cfg.difficulty)
+		end,
+		setAuto = function(value)
+			cfg.autoFarm = value and true or false
+			saveCfg()
+			if cfg.autoFarm then
+				farmLoop()
+			end
+		end,
+		setMap = function(map)
+			cfg.map = map
+			saveCfg()
+		end,
+		setDifficulty = function(diff)
+			cfg.difficulty = diff
+			saveCfg()
+		end,
+		state = function()
+			return {
+				map = cfg.map,
+				difficulty = cfg.difficulty,
+				auto = cfg.autoFarm,
+				runs = cfg.runs,
+				clears = cfg.clears,
+				last = cfg.lastResult,
+				walkSpeed = cfg.walkSpeed,
+			}
+		end,
+	}
+
+	if inLobby then
+		if cfg.autoFarm then
+			farmLoop()
+		end
+	else
+		task.spawn(missionWorker)
+	end
+end
+]==]
+
+local loader = loadstring(MAIN)
+if not loader then
+	warn("[SWAT Farm] failed to compile")
+	return
+end
+
+local ok, err = pcall(function()
+	local fn = loader()
+	if type(fn) ~= "function" then
+		error("script chunk did not return a function")
+	end
+	return fn(MAIN)
+end)
+
+if not ok then
+	warn("[SWAT Farm] runtime error: " .. tostring(err))
+end
